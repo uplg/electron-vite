@@ -1,3 +1,5 @@
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
@@ -16,50 +18,54 @@ function getBytecodeCompilerPath(): string {
   return path.join(path.dirname(_require.resolve('electron-vite/package.json')), 'bin', 'electron-bytecode.cjs')
 }
 
-function compileToBytecode(code: string): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    let data = Buffer.from([])
+let bytecodeId = 0
 
+function compileToBytecode(code: string, renderer: boolean): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
     const electronPath = getElectronPath()
     const bytecodePath = getBytecodeCompilerPath()
+    const id = `${process.pid}-${bytecodeId++}`
+    const inFile = path.join(os.tmpdir(), `electron-vite-bytecode-${id}.in.js`)
+    const outFile = path.join(os.tmpdir(), `electron-vite-bytecode-${id}.jsc`)
+    fs.writeFileSync(inFile, code)
+
+    // Compile in a real Electron process whose V8 isolate matches the one that will
+    // consume the cache. On V8 14.8+ (Electron 42+) the code cache is bound to a
+    // snapshot/isolate checksum AND a flag hash that differ per process type, so a cache
+    // built in the wrong process type is rejected (and forcing acceptance corrupts):
+    //   - main chunks    -> the Electron browser (main) process
+    //   - preload chunks -> a renderer process (a hidden window whose sandbox:false
+    //                       preload does the compile)
+    // Never ELECTRON_RUN_AS_NODE (its isolate matches neither on Electron 42+). Code in
+    // / cache out go through temp files (a GUI-subsystem process doesn't pipe stdio).
+    const env = { ...process.env, ELECTRON_VITE_BYTECODE_IN: inFile, ELECTRON_VITE_BYTECODE_OUT: outFile }
+    delete env.ELECTRON_RUN_AS_NODE
+    if (renderer) {
+      env.ELECTRON_VITE_BYTECODE_RENDERER = '1'
+    }
 
     const proc = spawn(electronPath, [bytecodePath], {
-      env: { ELECTRON_RUN_AS_NODE: '1' },
-      stdio: ['pipe', 'pipe', 'pipe', 'ipc']
+      env,
+      stdio: ['ignore', 'ignore', 'pipe']
     })
 
-    if (proc.stdin) {
-      proc.stdin.write(code)
-      proc.stdin.end()
-    }
-
-    if (proc.stdout) {
-      proc.stdout.on('data', chunk => {
-        data = Buffer.concat([data, chunk])
-      })
-      proc.stdout.on('error', err => {
-        console.error(err)
-      })
-      proc.stdout.on('end', () => {
-        resolve(data)
-      })
-    }
-
+    let stderr = ''
     if (proc.stderr) {
       proc.stderr.on('data', chunk => {
-        console.error('Error: ', chunk.toString())
-      })
-      proc.stderr.on('error', err => {
-        console.error('Error: ', err)
+        stderr += chunk.toString()
       })
     }
 
-    proc.addListener('message', message => console.log(message))
-    proc.addListener('error', err => console.error(err))
-
     proc.on('error', err => reject(err))
-    proc.on('exit', () => {
-      resolve(data)
+    proc.on('exit', exitCode => {
+      fs.rmSync(inFile, { force: true })
+      try {
+        const data = fs.readFileSync(outFile)
+        fs.rmSync(outFile, { force: true })
+        resolve(data)
+      } catch {
+        reject(new Error(`bytecode compilation failed (exit code ${exitCode})${stderr ? `:\n${stderr}` : ''}`))
+      }
     })
   })
 }
@@ -73,47 +79,37 @@ const bytecodeModuleLoaderCode = [
   `const Module = require("module");`,
   `v8.setFlagsFromString("--no-lazy");`,
   `v8.setFlagsFromString("--no-flush-bytecode");`,
-  `const FLAG_HASH_OFFSET = 12;`,
+  `const COMPILE_PARAMS = ["exports", "require", "module", "__filename", "__dirname"];`,
   `const SOURCE_HASH_OFFSET = 8;`,
-  `let dummyBytecode;`,
-  `function setFlagHashHeader(bytecodeBuffer) {`,
-  `  if (!dummyBytecode) {`,
-  `    const script = new vm.Script("", {`,
-  `      produceCachedData: true`,
-  `    });`,
-  `    dummyBytecode = script.createCachedData();`,
+  `function sourceLength(bytecodeBuffer) {`,
+  `  // The low 28 bits of the source hash hold the source length; the high bits are`,
+  `  // V8 source-hash flags (e.g. the "wrapped" bit set by vm.compileFunction).`,
+  `  return bytecodeBuffer.readUInt32LE(SOURCE_HASH_OFFSET) & 0x0fffffff;`,
+  `};`,
+  `function placeholderBody(len, filename) {`,
+  `  // A same-length body so the source hash matches. Its CONTENT is ignored (V8 runs`,
+  `  // the cached bytecode) but it must be UNIQUE per file, otherwise V8's in-isolate`,
+  `  // compilation cache returns a previously-compiled function for the same source.`,
+  `  const tag = "/*" + filename + " ";`,
+  `  if (tag.length + 2 <= len) {`,
+  `    return tag + " ".repeat(len - tag.length - 2) + "*/";`,
   `  }`,
-  `  dummyBytecode.slice(FLAG_HASH_OFFSET, FLAG_HASH_OFFSET + 4).copy(bytecodeBuffer, FLAG_HASH_OFFSET);`,
-  `};`,
-  `function getSourceHashHeader(bytecodeBuffer) {`,
-  `  return bytecodeBuffer.slice(SOURCE_HASH_OFFSET, SOURCE_HASH_OFFSET + 4);`,
-  `};`,
-  `function buffer2Number(buffer) {`,
-  `  let ret = 0;`,
-  `  ret |= buffer[3] << 24;`,
-  `  ret |= buffer[2] << 16;`,
-  `  ret |= buffer[1] << 8;`,
-  `  ret |= buffer[0];`,
-  `  return ret;`,
+  `  if (len >= 4) {`,
+  `    return "/*" + (filename + " ").slice(0, len - 4).padEnd(len - 4, " ") + "*/";`,
+  `  }`,
+  `  return " ".repeat(len);`,
   `};`,
   `Module._extensions[".jsc"] = Module._extensions[".cjsc"] = function (module, filename) {`,
   `  const bytecodeBuffer = fs.readFileSync(filename);`,
   `  if (!Buffer.isBuffer(bytecodeBuffer)) {`,
   `    throw new Error("BytecodeBuffer must be a buffer object.");`,
   `  }`,
-  `  setFlagHashHeader(bytecodeBuffer);`,
-  `  const length = buffer2Number(getSourceHashHeader(bytecodeBuffer));`,
-  `  let dummyCode = "";`,
-  `  if (length > 1) {`,
-  `    dummyCode = "\\"" + "\\u200b".repeat(length - 2) + "\\"";`,
-  `  }`,
-  `  const script = new vm.Script(dummyCode, {`,
+  `  const placeholder = placeholderBody(sourceLength(bytecodeBuffer), filename);`,
+  `  const compiledWrapper = vm.compileFunction(placeholder, COMPILE_PARAMS, {`,
   `    filename: filename,`,
-  `    lineOffset: 0,`,
-  `    displayErrors: true,`,
   `    cachedData: bytecodeBuffer`,
   `  });`,
-  `  if (script.cachedDataRejected) {`,
+  `  if (compiledWrapper.cachedDataRejected) {`,
   `    throw new Error("Invalid or incompatible cached data (cachedDataRejected)");`,
   `  }`,
   `  const require = function (id) {`,
@@ -127,15 +123,8 @@ const bytecodeModuleLoaderCode = [
   `  }`,
   `  require.extensions = Module._extensions;`,
   `  require.cache = Module._cache;`,
-  `  const compiledWrapper = script.runInThisContext({`,
-  `    filename: filename,`,
-  `    lineOffset: 0,`,
-  `    columnOffset: 0,`,
-  `    displayErrors: true`,
-  `  });`,
   `  const dirname = path.dirname(filename);`,
-  `  const args = [module.exports, require, module, filename, dirname, process, global];`,
-  `  return compiledWrapper.apply(module.exports, args);`,
+  `  return compiledWrapper.call(module.exports, module.exports, require, module, filename, dirname);`,
   `};`
 ]
 
@@ -190,6 +179,9 @@ export function bytecodePlugin(options: BytecodeOptions = {}): Plugin | null {
   const bytecodeModuleLoader = 'bytecode-loader.cjs'
 
   let supported = false
+  // Preload runs in a renderer-type V8 isolate (different snapshot/flags than the
+  // browser/main process), so its bytecode must be compiled in a renderer process.
+  let isPreload = false
 
   return {
     name: 'vite:bytecode',
@@ -199,6 +191,7 @@ export function bytecodePlugin(options: BytecodeOptions = {}): Plugin | null {
       if (supported) {
         return
       }
+      isPreload = config.plugins.some(p => p.name === 'vite:electron-preload-config-preset')
       const useInRenderer = config.plugins.some(p => p.name === 'vite:electron-renderer-preset-config')
       if (useInRenderer) {
         config.logger.warn(colors.yellow('bytecodePlugin does not support renderer.'))
@@ -274,7 +267,7 @@ export function bytecodePlugin(options: BytecodeOptions = {}): Plugin | null {
               }
             }
             if (bytecodeChunks.includes(name)) {
-              const bytecodeBuffer = await compileToBytecode(_code)
+              const bytecodeBuffer = await compileToBytecode(_code, isPreload)
               this.emitFile({
                 type: 'asset',
                 fileName: name + 'c',
