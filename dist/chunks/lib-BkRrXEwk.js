@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs$1 from 'node:fs/promises';
 import MagicString from 'magic-string';
+import os from 'node:os';
 import * as babel from '@babel/core';
 
 /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-function-type */
@@ -1167,43 +1168,43 @@ const _require$1 = createRequire(import.meta.url);
 function getBytecodeCompilerPath() {
     return path.join(path.dirname(_require$1.resolve('electron-vite/package.json')), 'bin', 'electron-bytecode.cjs');
 }
+let bytecodeId = 0;
 function compileToBytecode(code) {
     return new Promise((resolve, reject) => {
-        let data = Buffer.from([]);
         const electronPath = getElectronPath();
         const bytecodePath = getBytecodeCompilerPath();
+        const id = `${process.pid}-${bytecodeId++}`;
+        const inFile = path.join(os.tmpdir(), `electron-vite-bytecode-${id}.in.js`);
+        const outFile = path.join(os.tmpdir(), `electron-vite-bytecode-${id}.jsc`);
+        fs.writeFileSync(inFile, code);
+        // Compile in a real Electron MAIN process (not ELECTRON_RUN_AS_NODE) so the code
+        // cache carries the same V8 snapshot/isolate checksum as the runtime main/preload
+        // process. On V8 14.8+ (Electron 42+) a cache produced by a different isolate is
+        // rejected, and forcing acceptance corrupts complex modules. Code in / cache out go
+        // through temp files because a GUI-subsystem process doesn't pipe stdio reliably.
+        const env = { ...process.env, ELECTRON_VITE_BYTECODE_IN: inFile, ELECTRON_VITE_BYTECODE_OUT: outFile };
+        delete env.ELECTRON_RUN_AS_NODE;
         const proc = spawn(electronPath, [bytecodePath], {
-            env: { ELECTRON_RUN_AS_NODE: '1' },
-            stdio: ['pipe', 'pipe', 'pipe', 'ipc']
+            env,
+            stdio: ['ignore', 'ignore', 'pipe']
         });
-        if (proc.stdin) {
-            proc.stdin.write(code);
-            proc.stdin.end();
-        }
-        if (proc.stdout) {
-            proc.stdout.on('data', chunk => {
-                data = Buffer.concat([data, chunk]);
-            });
-            proc.stdout.on('error', err => {
-                console.error(err);
-            });
-            proc.stdout.on('end', () => {
-                resolve(data);
-            });
-        }
+        let stderr = '';
         if (proc.stderr) {
             proc.stderr.on('data', chunk => {
-                console.error('Error: ', chunk.toString());
-            });
-            proc.stderr.on('error', err => {
-                console.error('Error: ', err);
+                stderr += chunk.toString();
             });
         }
-        proc.addListener('message', message => console.log(message));
-        proc.addListener('error', err => console.error(err));
         proc.on('error', err => reject(err));
-        proc.on('exit', () => {
-            resolve(data);
+        proc.on('exit', exitCode => {
+            fs.rmSync(inFile, { force: true });
+            try {
+                const data = fs.readFileSync(outFile);
+                fs.rmSync(outFile, { force: true });
+                resolve(data);
+            }
+            catch {
+                reject(new Error(`bytecode compilation failed (exit code ${exitCode})${stderr ? `:\n${stderr}` : ''}`));
+            }
         });
     });
 }
@@ -1217,20 +1218,7 @@ const bytecodeModuleLoaderCode = [
     `v8.setFlagsFromString("--no-lazy");`,
     `v8.setFlagsFromString("--no-flush-bytecode");`,
     `const COMPILE_PARAMS = ["exports", "require", "module", "__filename", "__dirname"];`,
-    `const FLAG_HASH_OFFSET = 12;`,
-    `const SNAPSHOT_CHECKSUM_OFFSET = 16;`,
     `const SOURCE_HASH_OFFSET = 8;`,
-    `let dummyBytecode;`,
-    `function patchHeaders(bytecodeBuffer) {`,
-    `  if (!dummyBytecode) {`,
-    `    dummyBytecode = vm.compileFunction("", COMPILE_PARAMS, { produceCachedData: true }).cachedData;`,
-    `  }`,
-    `  // V8 14.8+ (Electron 42+) binds a code cache to the flag hash AND to a`,
-    `  // snapshot/isolate checksum. Copy both from a cache produced in THIS process so a`,
-    `  // cache produced at build time (a different isolate) is accepted at runtime.`,
-    `  dummyBytecode.copy(bytecodeBuffer, FLAG_HASH_OFFSET, FLAG_HASH_OFFSET, FLAG_HASH_OFFSET + 4);`,
-    `  dummyBytecode.copy(bytecodeBuffer, SNAPSHOT_CHECKSUM_OFFSET, SNAPSHOT_CHECKSUM_OFFSET, SNAPSHOT_CHECKSUM_OFFSET + 4);`,
-    `};`,
     `function sourceLength(bytecodeBuffer) {`,
     `  // The low 28 bits of the source hash hold the source length; the high bits are`,
     `  // V8 source-hash flags (e.g. the "wrapped" bit set by vm.compileFunction).`,
@@ -1254,7 +1242,6 @@ const bytecodeModuleLoaderCode = [
     `  if (!Buffer.isBuffer(bytecodeBuffer)) {`,
     `    throw new Error("BytecodeBuffer must be a buffer object.");`,
     `  }`,
-    `  patchHeaders(bytecodeBuffer);`,
     `  const placeholder = placeholderBody(sourceLength(bytecodeBuffer), filename);`,
     `  const compiledWrapper = vm.compileFunction(placeholder, COMPILE_PARAMS, {`,
     `    filename: filename,`,

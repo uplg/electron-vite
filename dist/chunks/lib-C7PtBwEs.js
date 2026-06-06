@@ -1,6 +1,6 @@
 import { createLogger, createServer as createServer$1, mergeConfig, build } from 'vite';
 import colors from 'picocolors';
-import { r as resolveConfig, c as resolveHostname, s as startElectron } from './lib-CxC63yju.js';
+import { r as resolveConfig, c as resolveHostname, s as startElectron } from './lib-BkRrXEwk.js';
 import 'node:path';
 import 'node:fs';
 import 'node:url';
@@ -10,6 +10,7 @@ import 'node:child_process';
 import 'node:crypto';
 import 'node:fs/promises';
 import 'magic-string';
+import 'node:os';
 import '@babel/core';
 
 async function createServer(inlineConfig = {}, options) {

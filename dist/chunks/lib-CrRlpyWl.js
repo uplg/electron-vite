@@ -1,5 +1,5 @@
 import { build as build$1 } from 'vite';
-import { r as resolveConfig } from './lib-CxC63yju.js';
+import { r as resolveConfig } from './lib-BkRrXEwk.js';
 import 'node:path';
 import 'node:fs';
 import 'node:url';
@@ -10,6 +10,7 @@ import 'node:child_process';
 import 'node:crypto';
 import 'node:fs/promises';
 import 'magic-string';
+import 'node:os';
 import '@babel/core';
 
 /**

@@ -1,37 +1,31 @@
+const { app } = require('electron')
 const vm = require('vm')
 const v8 = require('v8')
+const fs = require('fs')
 
 v8.setFlagsFromString('--no-lazy')
 v8.setFlagsFromString('--no-flush-bytecode')
 
-// Compile each chunk as a CommonJS module function via vm.compileFunction (instead of
-// vm.Script(module.wrap(code))). This is required on V8 14.8+ (Electron 42+): there a
-// code cache is only executed when consumed through the same API with --no-lazy, and
-// vm.Script no longer runs a cache when the loader supplies a placeholder source. The
-// runtime loader mirrors this (same params, vm.compileFunction).
+// Run as a real Electron MAIN process (spawned WITHOUT ELECTRON_RUN_AS_NODE) so the
+// produced code cache carries the same V8 snapshot/isolate checksum as the runtime
+// main/preload process. On V8 14.8+ (Electron 42+) a cache produced by a different
+// isolate (e.g. electron-as-node) is rejected, and forcing acceptance corrupts complex
+// modules. Code in / cache out go through temp files (env vars), since a GUI-subsystem
+// process doesn't read large stdin / write clean stdout reliably across platforms.
+app.disableHardwareAcceleration()
+
 const params = ['exports', 'require', 'module', '__filename', '__dirname']
+const inFile = process.env.ELECTRON_VITE_BYTECODE_IN
+const outFile = process.env.ELECTRON_VITE_BYTECODE_OUT
 
-let code = ''
-
-process.stdin.setEncoding('utf-8')
-
-process.stdin.on('readable', () => {
-  const data = process.stdin.read()
-  if (data !== null) {
-    code += data
-  }
-})
-
-process.stdin.on('end', () => {
+app.whenReady().then(() => {
   try {
-    if (typeof code !== 'string') {
-      throw new Error(`javascript code must be string. ${typeof code} was given.`)
-    }
-
+    const code = fs.readFileSync(inFile, 'utf-8')
     const fn = vm.compileFunction(code, params, { produceCachedData: true })
-
-    process.stdout.write(fn.cachedData)
+    fs.writeFileSync(outFile, fn.cachedData)
   } catch (error) {
     console.error(error)
+    process.exitCode = 1
   }
+  app.quit()
 })

@@ -1,7 +1,7 @@
 import colors from 'picocolors';
 import { createLogger } from 'vite';
-import { s as startElectron } from './lib-CxC63yju.js';
-import { build } from './lib-Djx6YmIC.js';
+import { s as startElectron } from './lib-BkRrXEwk.js';
+import { build } from './lib-CrRlpyWl.js';
 import 'node:path';
 import 'node:fs';
 import 'node:url';
@@ -11,6 +11,7 @@ import 'node:child_process';
 import 'node:crypto';
 import 'node:fs/promises';
 import 'magic-string';
+import 'node:os';
 import '@babel/core';
 
 async function preview(inlineConfig = {}, options) {
