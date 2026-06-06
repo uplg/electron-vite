@@ -20,7 +20,7 @@ function getBytecodeCompilerPath(): string {
 
 let bytecodeId = 0
 
-function compileToBytecode(code: string): Promise<Buffer> {
+function compileToBytecode(code: string, renderer: boolean): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const electronPath = getElectronPath()
     const bytecodePath = getBytecodeCompilerPath()
@@ -29,13 +29,20 @@ function compileToBytecode(code: string): Promise<Buffer> {
     const outFile = path.join(os.tmpdir(), `electron-vite-bytecode-${id}.jsc`)
     fs.writeFileSync(inFile, code)
 
-    // Compile in a real Electron MAIN process (not ELECTRON_RUN_AS_NODE) so the code
-    // cache carries the same V8 snapshot/isolate checksum as the runtime main/preload
-    // process. On V8 14.8+ (Electron 42+) a cache produced by a different isolate is
-    // rejected, and forcing acceptance corrupts complex modules. Code in / cache out go
-    // through temp files because a GUI-subsystem process doesn't pipe stdio reliably.
+    // Compile in a real Electron process whose V8 isolate matches the one that will
+    // consume the cache. On V8 14.8+ (Electron 42+) the code cache is bound to a
+    // snapshot/isolate checksum AND a flag hash that differ per process type, so a cache
+    // built in the wrong process type is rejected (and forcing acceptance corrupts):
+    //   - main chunks    -> the Electron browser (main) process
+    //   - preload chunks -> a renderer process (a hidden window whose sandbox:false
+    //                       preload does the compile)
+    // Never ELECTRON_RUN_AS_NODE (its isolate matches neither on Electron 42+). Code in
+    // / cache out go through temp files (a GUI-subsystem process doesn't pipe stdio).
     const env = { ...process.env, ELECTRON_VITE_BYTECODE_IN: inFile, ELECTRON_VITE_BYTECODE_OUT: outFile }
     delete env.ELECTRON_RUN_AS_NODE
+    if (renderer) {
+      env.ELECTRON_VITE_BYTECODE_RENDERER = '1'
+    }
 
     const proc = spawn(electronPath, [bytecodePath], {
       env,
@@ -172,6 +179,9 @@ export function bytecodePlugin(options: BytecodeOptions = {}): Plugin | null {
   const bytecodeModuleLoader = 'bytecode-loader.cjs'
 
   let supported = false
+  // Preload runs in a renderer-type V8 isolate (different snapshot/flags than the
+  // browser/main process), so its bytecode must be compiled in a renderer process.
+  let isPreload = false
 
   return {
     name: 'vite:bytecode',
@@ -181,6 +191,7 @@ export function bytecodePlugin(options: BytecodeOptions = {}): Plugin | null {
       if (supported) {
         return
       }
+      isPreload = config.plugins.some(p => p.name === 'vite:electron-preload-config-preset')
       const useInRenderer = config.plugins.some(p => p.name === 'vite:electron-renderer-preset-config')
       if (useInRenderer) {
         config.logger.warn(colors.yellow('bytecodePlugin does not support renderer.'))
@@ -256,7 +267,7 @@ export function bytecodePlugin(options: BytecodeOptions = {}): Plugin | null {
               }
             }
             if (bytecodeChunks.includes(name)) {
-              const bytecodeBuffer = await compileToBytecode(_code)
+              const bytecodeBuffer = await compileToBytecode(_code, isPreload)
               this.emitFile({
                 type: 'asset',
                 fileName: name + 'c',
