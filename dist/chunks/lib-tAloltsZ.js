@@ -1,6 +1,6 @@
 import { createLogger, createServer as createServer$1, mergeConfig, build } from 'vite';
 import colors from 'picocolors';
-import { r as resolveConfig, c as resolveHostname, s as startElectron } from './lib-D9Tt_0-h.js';
+import { r as resolveConfig, c as resolveHostname, s as startElectron } from './lib-CxC63yju.js';
 import 'node:path';
 import 'node:fs';
 import 'node:url';

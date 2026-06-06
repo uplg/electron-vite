@@ -106,9 +106,8 @@ export function deepClone<T>(value: T): DeepWritable<T> {
   if (value instanceof RegExp) {
     return new RegExp(value) as DeepWritable<T>
   }
-  if (typeof value === 'object' && value != null) {
-    throw new Error('Cannot deep clone non-plain object')
-  }
+  // Non-plain objects (vite plugins, Promises/thenables, class instances) cannot be
+  // safely deep-cloned and must not be mutated by config merging, so pass them through.
   return value as DeepWritable<T>
 }
 
