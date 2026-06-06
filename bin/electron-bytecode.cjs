@@ -1,9 +1,15 @@
 const vm = require('vm')
 const v8 = require('v8')
-const wrap = require('module').wrap
 
 v8.setFlagsFromString('--no-lazy')
 v8.setFlagsFromString('--no-flush-bytecode')
+
+// Compile each chunk as a CommonJS module function via vm.compileFunction (instead of
+// vm.Script(module.wrap(code))). This is required on V8 14.8+ (Electron 42+): there a
+// code cache is only executed when consumed through the same API with --no-lazy, and
+// vm.Script no longer runs a cache when the loader supplies a placeholder source. The
+// runtime loader mirrors this (same params, vm.compileFunction).
+const params = ['exports', 'require', 'module', '__filename', '__dirname']
 
 let code = ''
 
@@ -22,10 +28,9 @@ process.stdin.on('end', () => {
       throw new Error(`javascript code must be string. ${typeof code} was given.`)
     }
 
-    const script = new vm.Script(wrap(code), { produceCachedData: true })
-    const bytecodeBuffer = script.createCachedData()
+    const fn = vm.compileFunction(code, params, { produceCachedData: true })
 
-    process.stdout.write(bytecodeBuffer)
+    process.stdout.write(fn.cachedData)
   } catch (error) {
     console.error(error)
   }
